@@ -1,5 +1,5 @@
-import random
 import os
+import random
 import shutil
 
 import hyperparams as hp

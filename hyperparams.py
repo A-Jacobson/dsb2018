@@ -1,6 +1,5 @@
 root = '/home/austin/data/dsb'
 
-
 max_lr = 1e-3
 min_lr = 1e-5
 cycle_length = 400

@@ -26,4 +26,3 @@ class LossBinary:
 
             loss -= self.jaccard_weight * torch.log((intersection + eps) / (union - intersection + eps))
         return loss
-

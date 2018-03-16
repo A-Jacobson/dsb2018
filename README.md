@@ -1,5 +1,6 @@
 # 2018 Data Science Bowl
 https://www.kaggle.com/c/data-science-bowl-2018
+
 Find the nuclei in divergent images to advance medical discovery
 
 ![im](assets/nuclei_segmentation.png)

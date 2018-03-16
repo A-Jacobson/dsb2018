@@ -39,7 +39,7 @@ class LinkNet34(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
         filters = [64, 128, 256, 512]
-        resnet = models.resnet34(pretrained=True)
+        resnet = models.resnet34(pretrained=False)
 
         self.firstconv = resnet.conv1
         self.firstbn = resnet.bn1
