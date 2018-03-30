@@ -1,27 +1,25 @@
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def pad_to_factor(image, factor=16):
-    """Pads an image so that it is divisible by a given factor.
-    Set factor to 2 ** number of pooling layers in architecture).
-    Prevents size mismatches in Unet.
-    """
-    height, width = image.size()[-2:]
-    h = math.ceil(height / factor) * factor
-    w = math.ceil(width / factor) * factor
-    pad_height = h - height
-    pad_width = w - width
-    top = math.ceil(pad_height / 2)
-    bottom = math.floor(pad_height / 2)
-    left = math.ceil(pad_width / 2)
-    right = math.floor(pad_width / 2)
-    if any((top, bottom, left, right)):
-        return F.pad(image, mode='reflect', pad=(left, right, top, bottom))
-    return image
+# def pad_to_factor(image, factor=16):
+#     """Pads an image so that it is divisible by a given factor.
+#     Set factor to 2 ** number of pooling layers in architecture).
+#     Prevents size mismatches in Unet.
+#     """
+#     height, width = image.size()[-2:]
+#     h = math.ceil(height / factor) * factor
+#     w = math.ceil(width / factor) * factor
+#     pad_height = h - height
+#     pad_width = w - width
+#     top = math.ceil(pad_height / 2)
+#     bottom = math.floor(pad_height / 2)
+#     left = math.ceil(pad_width / 2)
+#     right = math.floor(pad_width / 2)
+#     if any((top, bottom, left, right)):
+#         return F.pad(image, mode='reflect', pad=(left, right, top, bottom))
+#     return image
 
 
 class DoubleConvBlock(nn.Module):
@@ -59,7 +57,6 @@ class Unet(nn.Module):
         self.conv10 = nn.Conv2d(32, 1, 1)
 
     def forward(self, x):
-        x = pad_to_factor(x, factor=2 ** 4)
         c1 = self.conv1(x)
         x = self.pool(c1)
         c2 = self.conv2(x)

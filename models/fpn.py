@@ -31,6 +31,11 @@ class FPN50(nn.Module):
 
     Feature Pyramid Networks for Object Detection
     https://arxiv.org/pdf/1612.03144.pdf
+
+    with input of size (256, 256) returns 5 feature maps of sizes
+    [(32, 32), (16, 16), (8, 8), (4, 4), (2, 2)]
+    strides:
+    [4, 8, 16, 32, 64, 128]
     """
 
     def __init__(self, pretrained=False):
@@ -70,5 +75,4 @@ class FPN50(nn.Module):
         p5 = self.pyramid_4(c5)  # (8, 8) coarsest feature map
         p4 = self.pyramid_3(p5, c4)
         p3 = self.pyramid_2(p4, c3)
-        #         p2 = self.pyramid_1(p3, c2) # retinanet removes p2
         return p3, p4, p5, p6, p7

@@ -1,5 +1,6 @@
+from .fpn import FPN50
 from .linknet import LinkNet34
-from .unet import Unet
 from .retinanet import RetinaNet
+from .unet import Unet
 
-__all__ = ('LinkNet34', 'Unet', 'RetinaNet')
+__all__ = ('LinkNet34', 'Unet', 'RetinaNet', 'FPN50')

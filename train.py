@@ -1,14 +1,20 @@
 import argparse
 
+import numpy as np
 import torch
+import torch.nn.functional as F
+from tensorboardX import SummaryWriter
+from torch.autograd import Variable
 from torch.optim import Adam
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 import hyperparams as hp
 import transforms as segtrans
 from datasets import DSBDataset
 from models import Unet
 from sgdr import LRFinderScheduler, SGDRScheduler
-from utils import train
+from utils.data import save, inverse_normalize
 
 parser = argparse.ArgumentParser(description='DSB Nuclei Training')
 parser.add_argument('--data',
@@ -62,10 +68,10 @@ def eval(model, val_dataset, batch_size, writer, step, device):
     for batch, (image, mask) in enumerate(loader):
         image, mask = Variable(image, volatile=True).cuda(device=device), Variable(mask, volatile=True).cuda(device)
         output = model(image)
-        loss = F.binary_cross_entropy_with_logits(output, pad_to_factor(mask))
+        loss = F.binary_cross_entropy_with_logits(output, mask)
         val_loss += loss.data[0]
         if batch == random_batch:
-            writer.add_image('image', inversenormalize(image.data.cpu()), step)
+            writer.add_image('image', inverse_normalize(image.data.cpu()), step)
             writer.add_image('output', F.sigmoid(output.data), step)
             writer.add_image('target', mask.data, step)
     val_loss /= len(loader)
@@ -85,7 +91,8 @@ def main():
                                         segtrans.Normalize(mean=hp.mean,
                                                            std=hp.std)])
 
-    val_transforms = segtrans.JointCompose([segtrans.ToTensor(),
+    val_transforms = segtrans.JointCompose([segtrans.PadToFactor(),
+                                            segtrans.ToTensor(),
                                             segtrans.Normalize(mean=hp.mean,
                                                                std=hp.std)])
 

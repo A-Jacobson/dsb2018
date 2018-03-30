@@ -26,6 +26,7 @@ def extract_bboxes(masks):
             # resizing or cropping. Set bbox to zeros
             x1, x2, y1, y2 = 0, 0, 0, 0
         boxes[i] = np.array([x1, y1, x2, y2])
+    # boxes = boxes[np.all(boxes, axis=1)]  # throw out zero boxes
     return torch.from_numpy(boxes)
 
 
@@ -39,6 +40,190 @@ def convert_wh(bbox):
     wh_bbox[2] = bbox[2] - bbox[0]
     wh_bbox[3] = bbox[3] - bbox[1]
     return wh_bbox
+
+
+class AnchorHelper:
+
+    def __init__(self,
+                 areas=(16, 32, 64, 128, 256),
+                 ratios=(0.5, 1, 2),
+                 scales=(2 ** 0, 2 ** (1. / 3.), 2 ** (2. / 3.)),
+                 pyramid_levels=(3, 4, 5, 6, 7),
+                 positive_overlap=0.5,
+                 negative_overlap=0.3):
+        self.areas = areas
+        self.ratios = ratios
+        self.scales = scales
+        self.pyramid_levels = pyramid_levels
+        self.pyramid_strides = [2 ** x for x in pyramid_levels]
+        self.positive_overlap = positive_overlap
+        self.negative_overlap = negative_overlap
+
+    def _top_left_anchors(self, area):
+        """
+        generates anchors (x1, y1, x2, y2)  for top left pixel in feature map
+        """
+        num_anchors = len(self.ratios) * len(self.scales)
+        anchors = np.zeros((num_anchors, 4))
+
+        # scale base_size
+        anchors[:, 2:] = area * np.tile(self.scales, (2, len(self.ratios))).T
+
+        # compute areas of anchors
+        areas = anchors[:, 2] * anchors[:, 3]  # W * H
+
+        # correct for ratios
+        anchors[:, 2] = np.sqrt(areas / np.repeat(self.ratios, len(self.scales)))
+        anchors[:, 3] = anchors[:, 2] * np.repeat(self.ratios, len(self.scales))
+
+        # transform from (x_ctr, y_ctr, w, h) -> (x1, y1, x2, y2)
+        anchors[:, 0::2] -= np.tile(anchors[:, 2] * 0.5, (2, 1)).T
+        anchors[:, 1::2] -= np.tile(anchors[:, 3] * 0.5, (2, 1)).T
+        return anchors
+
+    def _anchors_for_featuremap(self, top_left_anchors, features_shape, stride):
+        """
+        generates all anchors for feature map by shifting top_left anchors over the feature map
+        """
+        shift_x = (np.arange(0, features_shape[1]) + 0.5) * stride
+        shift_y = (np.arange(0, features_shape[0]) + 0.5) * stride
+
+        shift_x, shift_y = np.meshgrid(shift_x, shift_y)
+
+        shifts = np.vstack((
+            shift_x.ravel(), shift_y.ravel(),
+            shift_x.ravel(), shift_y.ravel()
+            )).transpose()
+
+        # add A anchors (1, A, 4) to
+        # cell K shifts (K, 1, 4) to get
+        # shift anchors (K, A, 4)
+        # reshape to (K*A, 4) shifted anchors
+        A = top_left_anchors.shape[0]
+        K = shifts.shape[0]
+        anchors = (top_left_anchors.reshape((1, A, 4)) + shifts.reshape((1, K, 4)).transpose((1, 0, 2)))
+        return anchors.reshape((K * A, 4))
+
+    def generate_anchors(self, image_size):
+        """
+        :param image_size: tuple (H , W) ex: (256, 256)
+        """
+        image_size = np.array(image_size)
+        anchors = np.zeros((0, 4))
+        for idx, p in enumerate(self.pyramid_levels):
+            top_left_anchors = self._top_left_anchors(area=self.areas[idx])  # top left anchor for feature map
+            anchors_one_level = self._anchors_for_featuremap(top_left_anchors,
+                                                             image_size // self.pyramid_strides[idx],
+                                                             self.pyramid_strides[idx])
+            anchors = np.append(anchors, anchors_one_level, axis=0)
+        return anchors
+
+    def assign_gt_boxes(self, image, gt_boxes, class_labels=None):
+        """
+        assigns gt boxes to most overlapping anchor boxes, each gt_box can have multiple assigned anchors.
+        """
+        image_shape = (image.size(-1), image.size(-2))
+        anchors = self.generate_anchors(image_shape)
+        gt_boxes = np.array(gt_boxes)
+
+        if class_labels is None:
+            class_labels = np.ones(len(gt_boxes))
+        # label: 1 is positive, 0 is negative, -1 is don't care
+        labels = np.ones(len(anchors)) * -1
+
+        # obtain indices of gt annotations with the greatest overlap
+        overlaps = compute_overlap(anchors, gt_boxes)
+        argmax_overlaps_inds = np.argmax(overlaps, axis=1)
+        max_overlaps = overlaps[np.arange(overlaps.shape[0]), argmax_overlaps_inds]
+
+        # assign bg labels first so that positive labels can clobber them
+        labels[max_overlaps < self.negative_overlap] = 0
+
+        # compute box regression targets
+        assigned_boxes = gt_boxes[argmax_overlaps_inds]
+        class_labels = class_labels[argmax_overlaps_inds]  # expand class labels and targets
+
+        # fg label: above threshold IOU
+        positive_indices = max_overlaps >= self.positive_overlap
+        labels[positive_indices] = 0
+        labels[positive_indices] = class_labels[positive_indices]
+
+        # ignore annotations outside of image
+        anchors_centers = np.vstack([(anchors[:, 0] + anchors[:, 2]) / 2, (anchors[:, 1] + anchors[:, 3]) / 2]).T
+        indices = np.logical_or(anchors_centers[:, 0] >= image_shape[1], anchors_centers[:, 1] >= image_shape[0])
+        labels[indices] = -1
+        return labels, assigned_boxes, anchors
+
+    def make_targets(self, image, gt_boxes, class_labels=None):
+        """
+        Generates Anchors for image
+        Assigns anchors to gt_boxes
+        Computes bbox deltas for assigned anchors
+        :return: retinanet class_labels and anchor_deltas
+        """
+        labels, assigned_boxes, anchors = self.assign_gt_boxes(image, gt_boxes, class_labels)
+        anchor_deltas = get_deltas(anchors, assigned_boxes)
+        return torch.LongTensor(labels), torch.FloatTensor(anchor_deltas)
+
+
+def get_deltas(anchors, gt_boxes):
+    """Compute bounding-box regression targets
+    (log(difference) between anchors and gt_boxes) for an image."""
+
+    # transform from (x1, y1, x2, y2) -> (x_ctr, y_ctr, w, h)
+    anchor_widths = anchors[:, 2] - anchors[:, 0]
+    anchor_heights = anchors[:, 3] - anchors[:, 1]
+    anchor_ctr_x = anchors[:, 0] + 0.5 * anchor_widths
+    anchor_ctr_y = anchors[:, 1] + 0.5 * anchor_heights
+
+    gt_widths = gt_boxes[:, 2] - gt_boxes[:, 0]
+    gt_heights = gt_boxes[:, 3] - gt_boxes[:, 1]
+    gt_ctr_x = gt_boxes[:, 0] + 0.5 * gt_widths
+    gt_ctr_y = gt_boxes[:, 1] + 0.5 * gt_heights
+
+    # clip widths to 1
+    gt_widths = np.maximum(gt_widths, 1)
+    gt_heights = np.maximum(gt_heights, 1)
+
+    targets_dx = (gt_ctr_x - anchor_ctr_x) / anchor_widths
+    targets_dy = (gt_ctr_y - anchor_ctr_y) / anchor_heights
+    targets_dw = np.log(gt_widths / anchor_widths)
+    targets_dh = np.log(gt_heights / anchor_heights)
+
+    deltas = np.stack((targets_dx, targets_dy, targets_dw, targets_dh)).T
+    return deltas
+
+
+def apply_deltas(boxes, deltas):
+    """
+    apply predicted deltas to anchor (prior) boxes
+    """
+    boxes = boxes.reshape(-1, 4)
+    deltas = deltas.reshape(-1, 4)
+
+    widths = boxes[:, 2] - boxes[:, 0]
+    heights = boxes[:, 3] - boxes[:, 1]
+    ctr_x = boxes[:, 0] + 0.5 * widths
+    ctr_y = boxes[:, 1] + 0.5 * heights
+
+    dx = deltas[:, 0]
+    dy = deltas[:, 1]
+    dw = deltas[:, 2]
+    dh = deltas[:, 3]
+
+    pred_ctr_x = ctr_x + dx * widths
+    pred_ctr_y = ctr_y + dy * heights
+    pred_w = np.exp(dw) * widths
+    pred_h = np.exp(dh) * heights
+
+    pred_boxes_x1 = pred_ctr_x - 0.5 * pred_w
+    pred_boxes_y1 = pred_ctr_y - 0.5 * pred_h
+    pred_boxes_x2 = pred_ctr_x + 0.5 * pred_w
+    pred_boxes_y2 = pred_ctr_y + 0.5 * pred_h
+
+    pred_boxes = np.stack([pred_boxes_x1, pred_boxes_y1, pred_boxes_x2, pred_boxes_y2], axis=1)
+    pred_boxes = np.expand_dims(pred_boxes, axis=0)
+    return pred_boxes
 
 
 def compute_overlap(a, b):
@@ -68,220 +253,6 @@ def compute_overlap(a, b):
     return intersection / ua
 
 
-def generate_anchors(base_size=16, ratios=None, scales=None):
-    """
-    Generate anchor (reference) windows by enumerating aspect ratios X
-    scales w.r.t. a reference window.
-    """
-
-    if ratios is None:
-        ratios = np.array([0.5, 1, 2])
-
-    if scales is None:
-        scales = np.array([2 ** 0, 2 ** (1.0 / 3.0), 2 ** (2.0 / 3.0)])
-
-    num_anchors = len(ratios) * len(scales)
-
-    # initialize output anchors
-    anchors = np.zeros((num_anchors, 4))
-
-    # scale base_size
-    anchors[:, 2:] = base_size * np.tile(scales, (2, len(ratios))).T
-
-    # compute areas of anchors
-    areas = anchors[:, 2] * anchors[:, 3]
-
-    # correct for ratios
-    anchors[:, 2] = np.sqrt(areas / np.repeat(ratios, len(scales)))
-    anchors[:, 3] = anchors[:, 2] * np.repeat(ratios, len(scales))
-
-    # transform from (x_ctr, y_ctr, w, h) -> (x1, y1, x2, y2)
-    anchors[:, 0::2] -= np.tile(anchors[:, 2] * 0.5, (2, 1)).T
-    anchors[:, 1::2] -= np.tile(anchors[:, 3] * 0.5, (2, 1)).T
-
-    return anchors
-
-
-def assign_anchors(
-        image_shape,
-        gt_boxes,
-        class_labels,
-        num_classes,
-        mask_shape=None,
-        negative_overlap=0.4,
-        positive_overlap=0.5):
-    annotations = np.hstack([gt_boxes, class_labels[:, None]])
-    anchors = anchors_for_shape(image_shape)
-
-    # label: 1 is positive, 0 is negative, -1 is dont care
-    labels = np.ones(anchors.shape[0]) * -1
-
-    if annotations.shape[0]:
-        # obtain indices of gt annotations with the greatest overlap
-        overlaps = compute_overlap(anchors, annotations[:, :4])
-        argmax_overlaps_inds = np.argmax(overlaps, axis=1)
-        max_overlaps = overlaps[np.arange(overlaps.shape[0]), argmax_overlaps_inds]
-
-        # assign bg labels first so that positive labels can clobber them
-        labels[max_overlaps < negative_overlap] = 0
-
-        # compute box regression targets
-        annotations = annotations[argmax_overlaps_inds]
-
-        # fg label: above threshold IOU
-        positive_indices = max_overlaps >= positive_overlap
-        labels[positive_indices] = 0
-        labels[positive_indices] = annotations[positive_indices, 4]
-    else:
-        # no annotations? then everything is background
-        labels[:] = 0
-        annotations = np.zeros_like(anchors)
-
-    # ignore annotations outside of image
-    mask_shape = image_shape if mask_shape is None else mask_shape
-    anchors_centers = np.vstack([(anchors[:, 0] + anchors[:, 2]) / 2, (anchors[:, 1] + anchors[:, 3]) / 2]).T
-    indices = np.logical_or(anchors_centers[:, 0] >= mask_shape[1], anchors_centers[:, 1] >= mask_shape[0])
-    labels[indices] = -1
-
-    return labels, annotations[:, :4], anchors
-
-
-def anchors_for_shape(
-        image_shape,
-        pyramid_levels=None,
-        ratios=None,
-        scales=None,
-        strides=None,
-        sizes=None
-        ):
-    if pyramid_levels is None:
-        pyramid_levels = [3, 4, 5, 6, 7]
-    if strides is None:
-        strides = [2 ** x for x in pyramid_levels]
-    if sizes is None:
-        sizes = [2 ** (x + 2) for x in pyramid_levels]
-    if ratios is None:
-        ratios = np.array([0.5, 1, 2])
-    if scales is None:
-        scales = np.array([2 ** 0, 2 ** (1.0 / 3.0), 2 ** (2.0 / 3.0)])
-
-    # skip the first two levels
-    image_shape = np.array(image_shape[:2])
-    for i in range(pyramid_levels[0] - 1):
-        image_shape = (image_shape + 1) // 2
-
-    # compute anchors over all pyramid levels
-    all_anchors = np.zeros((0, 4))
-    for idx, p in enumerate(pyramid_levels):
-        image_shape = (image_shape + 1) // 2
-        anchors = generate_anchors(base_size=sizes[idx], ratios=ratios, scales=scales)
-        shifted_anchors = shift(image_shape, strides[idx], anchors)
-        all_anchors = np.append(all_anchors, shifted_anchors, axis=0)
-
-    return all_anchors
-
-
-def shift(shape, stride, anchors):
-    shift_x = (np.arange(0, shape[1]) + 0.5) * stride
-    shift_y = (np.arange(0, shape[0]) + 0.5) * stride
-
-    shift_x, shift_y = np.meshgrid(shift_x, shift_y)
-
-    shifts = np.vstack((
-        shift_x.ravel(), shift_y.ravel(),
-        shift_x.ravel(), shift_y.ravel()
-        )).transpose()
-
-    # add A anchors (1, A, 4) to
-    # cell K shifts (K, 1, 4) to get
-    # shift anchors (K, A, 4)
-    # reshape to (K*A, 4) shifted anchors
-    A = anchors.shape[0]
-    K = shifts.shape[0]
-    all_anchors = (anchors.reshape((1, A, 4)) + shifts.reshape((1, K, 4)).transpose((1, 0, 2)))
-    all_anchors = all_anchors.reshape((K * A, 4))
-
-    return all_anchors
-
-
-def compute_anchor_targets(anchors, gt_boxes, mean=None, std=None):
-    """Compute bounding-box regression targets for an image."""
-
-    if mean is None:
-        mean = np.array([0, 0, 0, 0])
-    if std is None:
-        std = np.array([0.1, 0.1, 0.2, 0.2])
-
-    if isinstance(mean, (list, tuple)):
-        mean = np.array(mean)
-    elif not isinstance(mean, np.ndarray):
-        raise ValueError('Expected mean to be a np.ndarray, list or tuple. Received: {}'.format(type(mean)))
-
-    if isinstance(std, (list, tuple)):
-        std = np.array(std)
-    elif not isinstance(std, np.ndarray):
-        raise ValueError('Expected std to be a np.ndarray, list or tuple. Received: {}'.format(type(std)))
-
-    anchor_widths = anchors[:, 2] - anchors[:, 0]
-    anchor_heights = anchors[:, 3] - anchors[:, 1]
-    anchor_ctr_x = anchors[:, 0] + 0.5 * anchor_widths
-    anchor_ctr_y = anchors[:, 1] + 0.5 * anchor_heights
-
-    gt_widths = gt_boxes[:, 2] - gt_boxes[:, 0]
-    gt_heights = gt_boxes[:, 3] - gt_boxes[:, 1]
-    gt_ctr_x = gt_boxes[:, 0] + 0.5 * gt_widths
-    gt_ctr_y = gt_boxes[:, 1] + 0.5 * gt_heights
-
-    # clip widths to 1
-    gt_widths = np.maximum(gt_widths, 1)
-    gt_heights = np.maximum(gt_heights, 1)
-
-    targets_dx = (gt_ctr_x - anchor_ctr_x) / anchor_widths
-    targets_dy = (gt_ctr_y - anchor_ctr_y) / anchor_heights
-    targets_dw = np.log(gt_widths / anchor_widths)
-    targets_dh = np.log(gt_heights / anchor_heights)
-
-    targets = np.stack((targets_dx, targets_dy, targets_dw, targets_dh))
-    targets = targets.T
-
-    deltas = (targets - mean) / std
-
-    return deltas
-
-
-def apply_anchor_deltas(boxes, deltas):
-    """
-    apply changes to anchor boxes
-    """
-    boxes = boxes.reshape(-1, 4)
-    deltas = deltas.reshape(-1, 4)
-
-    widths = boxes[:, 2] - boxes[:, 0]
-    heights = boxes[:, 3] - boxes[:, 1]
-    ctr_x = boxes[:, 0] + 0.5 * widths
-    ctr_y = boxes[:, 1] + 0.5 * heights
-
-    dx = deltas[:, 0]
-    dy = deltas[:, 1]
-    dw = deltas[:, 2]
-    dh = deltas[:, 3]
-
-    pred_ctr_x = ctr_x + dx * widths
-    pred_ctr_y = ctr_y + dy * heights
-    pred_w = np.exp(dw) * widths
-    pred_h = np.exp(dh) * heights
-
-    pred_boxes_x1 = pred_ctr_x - 0.5 * pred_w
-    pred_boxes_y1 = pred_ctr_y - 0.5 * pred_h
-    pred_boxes_x2 = pred_ctr_x + 0.5 * pred_w
-    pred_boxes_y2 = pred_ctr_y + 0.5 * pred_h
-
-    pred_boxes = np.stack([pred_boxes_x1, pred_boxes_y1, pred_boxes_x2, pred_boxes_y2], axis=1)
-    pred_boxes = np.expand_dims(pred_boxes, axis=0)
-
-    return pred_boxes
-
-
 def compute_iou(box, boxes, box_area, boxes_area):
     """Calculates IoU of the given box with the array of the given boxes.
     box: 1D vector [y1, x1, y2, x2]
@@ -308,10 +279,6 @@ def non_max_suppression(boxes, scores, threshold):
     scores: 1-D array of box scores.
     threshold: Float. IoU threshold to use for filtering.
     """
-    assert boxes.shape[0] > 0
-    if boxes.dtype.kind != "f":
-        boxes = boxes.astype(np.float32)
-
     # Compute box areas
     y1 = boxes[:, 0]
     x1 = boxes[:, 1]
@@ -337,19 +304,3 @@ def non_max_suppression(boxes, scores, threshold):
         ixs = np.delete(ixs, remove_ixs)
         ixs = np.delete(ixs, 0)
     return np.array(pick, dtype=np.int32)
-
-
-def get_detection_targets(img, boxes):
-    """
-    :param img:
-    :param boxes: gt bounding boxes
-    :return: [len(num_anchors)] class indicies, bounding box deltas [num_anchors, 4]
-    """
-    image_shape = tuple(img.size()[-2:])
-    class_labels = np.ones(boxes.size(0))
-    class_targets, gt_boxes, anchors = assign_anchors(image_shape, boxes.numpy(),
-                                               class_labels, num_classes=2)
-    box_targets = compute_anchor_targets(anchors, gt_boxes)  ## bbox deltas
-    return torch.from_numpy(class_targets).long(), torch.from_numpy(box_targets).float(), anchors
-
-

@@ -70,4 +70,3 @@ def inverse_normalize(img, mean=hp.mean, std=hp.std):
     mean = torch.Tensor(mean)
     std = torch.Tensor(std)
     return img * std.view(3, 1, 1) + mean.view(3, 1, 1)
-

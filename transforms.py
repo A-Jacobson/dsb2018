@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torchvision.transforms.functional as F
 from PIL import Image
@@ -76,6 +78,34 @@ class ToTensor:
         else:
             mask_tensor = F.to_tensor(mask)
         return img_tensor, mask_tensor
+
+
+class PadToFactor:
+    """Pads an image so that it is divisible by a given factor.
+    Set factor to 2 ** (number of pooling layers) in the architecture).
+    Prevents size mismatches in Unet.
+    """
+
+    def __init__(self, factor=2 ** 4, fill=0):
+        self.factor = factor
+        self.fill = fill
+
+    def calculate_padding(self, height, width):
+        new_height = math.ceil(height / self.factor) * self.factor
+        new_width = math.ceil(width / self.factor) * self.factor
+        pad_height = new_height - height
+        pad_width = new_width - width
+        top = math.ceil(pad_height / 2)
+        bottom = math.floor(pad_height / 2)
+        left = math.ceil(pad_width / 2)
+        right = math.floor(pad_width / 2)
+        return left, right, top, bottom
+
+    def __call__(self, img, mask):
+        padding = self.calculate_padding(img.height, img.width)
+        img = F.pad(img, padding=padding, fill=self.fill)
+        mask = F.pad(mask, padding=padding, fill=self.fill)
+        return img, mask
 
 
 class Normalize:
