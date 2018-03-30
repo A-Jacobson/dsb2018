@@ -9,6 +9,7 @@ class FocalLoss(nn.Module):
 
     NOTE: this alpha overweights positive classes.
     This creates a loss magnitude more equal with the bbox loss
+    TODO: Loss goes to zero very quickly?
     """
 
     def __init__(self, gamma=2, alpha=1e3, ignore_index=-1):
@@ -25,6 +26,5 @@ class FocalLoss(nn.Module):
         P = F.softmax(outputs, dim=1).max(dim=1)[0]
         cross_entropy = F.cross_entropy(outputs, targets.view(-1),
                                         ignore_index=self.ignore_index,
-                                        reduce=True)
-        return cross_entropy
+                                        reduce=False, weight=alpha)
         return ((1.0 - P) ** self.gamma * cross_entropy).mean()

@@ -84,13 +84,12 @@ def main():
     ROOT = '/home/austin/data/dsb/train'
 
     transforms = segtrans.JointCompose([segtrans.Resize(300),
-                                        segtrans.RandomRotate(0, 90),
                                         segtrans.RandomCrop(256, 256),
                                         segtrans.ToTensor()], instance_masks=True)
 
     anchor_helper = AnchorHelper(areas=(16, 32, 64, 128, 256),
                                  positive_overlap=0.5,
-                                 negative_overlap=0.3)
+                                 negative_overlap=0.4)
 
     dataset = DSBDataset(ROOT, transforms, merge_masks=False, anchor_helper=anchor_helper)
 
@@ -98,8 +97,8 @@ def main():
     model.cuda()
     optimizer = Adam(model.parameters(), lr=1e-5)
     focal_loss = FocalLoss(gamma=2, alpha=1e3, ignore_index=-1)
-    scheduler = SGDRScheduler(optimizer, min_lr=1e-5,
-                              max_lr=1e-3, cycle_length=400, current_step=0)
+    scheduler = SGDRScheduler(optimizer, min_lr=1e-7,
+                              max_lr=1e-6, cycle_length=400, current_step=0)
     train(model, optimizer, scheduler, focal_loss, dataset,
           n_epochs=20, batch_size=12,
           exp_name='retinacat')
